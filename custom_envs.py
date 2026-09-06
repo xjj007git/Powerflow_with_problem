@@ -18,6 +18,7 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 class PowerSystemEnv(gym.Env):
     def __init__(self, mpc, path):
@@ -105,15 +106,15 @@ class PowerSystemEnv(gym.Env):
 
         # ---- 状态空间 ----
         self.obs_low = np.concatenate([
-            np.zeros(self.grid['num_loads']),               # p_d
-            np.zeros(self.grid['num_loads']),               # q_d
-            -50 * np.ones(self.grid['num_wind']),           # q_w
+            0.5 * self.grid['base_pd'],                     # p_d 下限
+            0.5 * self.grid['base_qd'],                     # q_d 下限  见论文第四部分
+            0.6 * 50 * np.ones(self.grid['num_wind']),      # p_w 下限
             np.zeros(self.grid['num_gen'])                  # p_u_prev
         ])
         self.obs_high = np.concatenate([
             1.2 * self.grid['base_pd'],                     # p_d 上限
             1.2 * self.grid['base_qd'],                     # q_d 上限
-            50 * np.ones(self.grid['num_wind']),            # q_w 上限
+            50 * np.ones(self.grid['num_wind']),            # p_w 上限
             self.grid['gen_Pmax']                           # p_u_prev 上限
         ])
 
@@ -122,50 +123,53 @@ class PowerSystemEnv(gym.Env):
 
         #把y边界定义放init
         self.y_low = np.concatenate([
-            np.zeros(self.grid['num_loads']),               # p_d
-            np.zeros(self.grid['num_loads']),               # q_d     20个负载
-            -50 * np.ones(self.grid['num_wind'])           # q_w     3个风机的pw
+            0.5 * self.grid['base_pd'],                     # p_d 下限
+            0.5 * self.grid['base_qd'],                     # q_d 下限
+            0.6 * 50 * np.ones(self.grid['num_wind']),      # p_w 下限
         ])
         self.y_high = np.concatenate([
             1.2 * self.grid['base_pd'],                     # p_d 上限
             1.2 * self.grid['base_qd'],                     # q_d 上限
-            50 * np.ones(self.grid['num_wind'])            # q_w 上限假设50MWA
+            50 * np.ones(self.grid['num_wind'])            # p_w 上限假设50MWA
         ])
 
         # ---- 动作空间 ----
         # 非平衡机有功上限
         non_slack_Pmax = self.grid['gen_Pmax'][self.grid['non_slack_indices']]
         self.act_low = np.concatenate([
-            # np.zeros(self.grid['num_non_slack']),           # 非平衡机有功
-            # 0.9 * np.ones(self.grid['num_gen']),            # 电压设定
             self.grid['act_pg_min'],
             self.grid['act_v_min'],                         #这里就是标幺值
             np.zeros(self.grid['num_loads']),               # 负荷削减
             np.zeros(self.grid['num_wind'])                 # 弃风
         ])
         self.act_high = np.concatenate([
-            # non_slack_Pmax,
-            # 1.1 * np.ones(self.grid['num_gen']),
             self.grid['act_pg_max'],
             self.grid['act_v_max'],
-            np.ones(self.grid['num_loads']),
+            0.3 * np.ones(self.grid['num_loads']),          #负荷最大削减比降低到30%
             np.ones(self.grid['num_wind'])
         ])
         self.action_space = gym.spaces.Box(low=self.act_low, high=self.act_high, dtype=np.float32)
         self.act_dim = self.action_space.shape[0]
 
-        # 内部状态：当前系统状态（包含潮流结果）
+        #成本参数
+        self.load_shed_cost = 15.0      #10
+        self.wind_curt_cost = 500.0
         self.Cmax = self.calculate_cmax()
+
+        #内部超参数
+        self.epsilon0 = 8e-4    #5e-4   4e-4
+        self.epsilon1 = 0.1
+        self.R0 = 100.0
+        self.R1 = 20
+
+        # 内部状态：当前系统状态
         self.current_state = None
         self.terminated = False
         self.truncated = False
 
-    def compute_reward(self, cost, dcv, cmax, epsilon0=1e-4, epsilon1=0.1, R0=100.0, R1=20.0):
-        """
-        论文公式 (7)
-        epsilon0=1e-4 是 DCV 的容忍度,epsilon1=0.1 是严重违规的阈值
-        R0=1e-4 是基本奖励,R1=20.0 是成本奖励的权重
-        """
+    def compute_reward(self, cost, dcv, cmax, epsilon0, epsilon1, R0, R1):
+        #打印测试数值
+        # print(f"epsilon0是:{epsilon0}")
         if dcv > epsilon1:
             # 严重不可行，给予零奖励（或一个很大的负惩罚，论文中是0）
             reward = 0.0
@@ -323,16 +327,18 @@ class PowerSystemEnv(gym.Env):
             c2 = self.grid['gen_cost'][i, 4]
             p_max = self.grid['gen_Pmax'][i]
             total_cost_max += c2 * p_max**2 + c1 * p_max + c0
+
+        #还需要添加最大弃载成本
+        total_cost_max += np.sum(self.load_shed_cost * self.grid['base_pd'])  # 假设最大弃载为基准负荷
+
         return total_cost_max
     
-    def calculate_generation_cost(self,state):
-        """
-        根据 gencost_np 计算总发电成本 (欧元/小时)
-        支持二次多项式: cost = c2 * P^2 + c1 * P + c0
-        这里只计算有功费用
-        """
+    def calculate_generation_cost(self, state, load_shed):
         total_cost = 0.0
-        
+        C_gen = 0.0
+        C_load_shed = 0.0
+
+        #发电机有功成本
         pg_non_slack = state['gen'][:, 0]
         pg_slack = state['slack'][0]
 
@@ -348,7 +354,17 @@ class PowerSystemEnv(gym.Env):
         c1_s = self.grid['gen_cost'][self.grid['slack_idx'], 5]
         c2_s = self.grid['gen_cost'][self.grid['slack_idx'], 4]
         total_cost += c2_s * pg_slack**2 + c1_s * pg_slack + c0_s
-        return total_cost
+
+        C_gen = total_cost
+
+        #弃载成本
+        gross_load_p = state['loads'][:, 0].copy()
+        total_cost += np.sum(self.load_shed_cost * gross_load_p * load_shed)
+
+        C_load_shed = np.sum(self.load_shed_cost * gross_load_p * load_shed)
+
+        return total_cost, C_gen, C_load_shed
+
 
     def _compute_base_powerflow(self):
         #做一次潮流计算获取一个可能存在的初始状态，以供初始化
@@ -381,13 +397,14 @@ class PowerSystemEnv(gym.Env):
         p_u_prev = np.concatenate([p_u_prev_slack, p_u_prev_non_slack]) #感觉不影响计算，因为obs不直接参与计算
 
         obs = np.concatenate([p_d, q_d, p_w, p_u_prev]).astype(np.float32)
-        obs_low = self.obs_low
-        obs_high = self.obs_high
-        eps = 1e-8
-        obs_norm = 2 * (obs - obs_low) / (obs_high - obs_low + eps) - 1
+        # obs_low = self.obs_low
+        # obs_high = self.obs_high
+        # eps = 1e-8
+        # obs_norm = 2 * (obs - obs_low) / (obs_high - obs_low + eps) - 1
+        # obs_norm = np.clip(obs_norm, -1, 1) #防越界处理
         # print(f"obs:{obs}")
-        return obs_norm
-        # return obs
+        # return obs_norm       #这里试图将obs映射到-1到1,不知道想干什么
+        return obs
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed) #仅仅对seed进行了设置
@@ -445,21 +462,26 @@ class PowerSystemEnv(gym.Env):
 
         #先把每一个load,wind节点的Pd,Pw给计算好,为之后计算发电机净出力铺垫,因为HELM计算出来的Bus净出力
         #同时,obs中的Pd,Qd 应该是在负载削减前的, 否则会越来越小
-        obs_load_p = self.current_state['loads'][:, 0]
-        obs_load_q = self.current_state['loads'][:, 1]
-        actual_load_p = self.current_state['loads'][:, 0] * (np.ones(self.grid['num_loads']) - control['load_shed'])
-        actual_load_q = self.current_state['loads'][:, 1] * (np.ones(self.grid['num_loads']) - control['load_shed'])
-        # print(f"current_state的load_p:{self.current_state['loads'][:, 0]}")
-        # print(f"current_state的load_q:{self.current_state['loads'][:, 1]}")
-        # print(f"弃载比例是:{control['load_shed']}")
-        # print(f"actual_load_p:{actual_load_p}")
-        # print(f"actual_load_q:{actual_load_q}\n")
-        # time.sleep(1)
+        gross_load_p = self.current_state['loads'][:, 0].copy()
+        gross_load_q = self.current_state['loads'][:, 1].copy()
+
+        #此处记录返回的gross_load_pq,在step之外组合写入excel查看gross_load_pq不会衰减
+        #为什么在step外组合?因为step每次操作excel的库与mat之类冲突,会搞炸环境,我选择保守操作
+        gross_load_pq = np.concatenate([gross_load_p, gross_load_q])
+
+        #零削减
+        # served_load_p = gross_load_p.copy()
+        # served_load_q = gross_load_q.copy()
+
+        #非零削减
+        served_load_p = self.current_state['loads'][:, 0] * (np.ones(self.grid['num_loads']) - control['load_shed'])
+        served_load_q = self.current_state['loads'][:, 1] * (np.ones(self.grid['num_loads']) - control['load_shed'])
+        served_load_pq = np.concatenate([served_load_p, served_load_q])
 
         #用来测试Q越界,用来存下当前状态的负载p,q,用来对HELM层反复计算
         self.re_HE_state = self.current_state.copy()
-        self.re_HE_load_p = actual_load_p
-        self.re_HE_load_q = actual_load_q
+        self.re_HE_load_p = served_load_p
+        self.re_HE_load_q = served_load_q
 
         #获取HELM求解器
         net_HE = self.net_HE
@@ -475,7 +497,7 @@ class PowerSystemEnv(gym.Env):
 
         #利用control和self.current_state修改S_pq
         # S_total[net_HE.net.load.bus] = S_total[net_HE.net.load.bus] - self.current_state['loads'][:, 0] * (np.ones(self.grid['num_loads']) - control['load_shed']) - 1j * self.current_state['loads'][:, 1] * (np.ones(self.grid['num_loads']) - control['load_shed'])
-        S_total[net_HE.net.load.bus] = S_total[net_HE.net.load.bus] - actual_load_p - 1j * actual_load_q    #负载可以在gen上面对节点叠加,不影响
+        S_total[net_HE.net.load.bus] = S_total[net_HE.net.load.bus] - served_load_p - 1j * served_load_q    #负载可以在gen上面对节点叠加,不影响
         if len(net_HE.net.sgen.bus) > 0:
             S_total[net_HE.net.sgen.bus] = S_total[net_HE.net.sgen.bus] + net_HE.net.sgen.p_mw
         S_total = S_total/net_HE.net._ppc["baseMVA"]
@@ -500,32 +522,35 @@ class PowerSystemEnv(gym.Env):
         for bus in load_on_gen_buses:
             gen_idx = np.where(self.grid['gen_buses'] == bus)[0][0]
             load_idx = np.where(self.grid['load_buses'] == bus)[0][0]
-            P_load_on_gen[gen_idx] = actual_load_p[load_idx]
-            Q_load_on_gen[gen_idx] = actual_load_q[load_idx]
+            P_load_on_gen[gen_idx] = served_load_p[load_idx]
+            Q_load_on_gen[gen_idx] = served_load_q[load_idx]
         S_gen = S_HE_mw[self.grid['gen_buses']] + (P_load_on_gen + 1j * Q_load_on_gen)
         gen_p_mw = np.real(S_gen)
         gen_q_mva = np.imag(S_gen)
 
+        #计算成本应该在状态转移修改pd之前计算完毕
+        # 计算成本C
+        C, C_gen, C_load_shed = self.calculate_generation_cost(self.current_state, control['load_shed'])
+
+        #状态转移函数
         #y的随机分布,这里pd,qd也应该改成负荷削减之后的
-        p_d_curr = obs_load_p
-        q_d_curr = obs_load_q
+        p_d_curr = gross_load_p.copy()
+        q_d_curr = gross_load_q.copy()
         if self.grid['num_wind'] > 0:
             p_w_curr = self.current_state['winds'][:, 0] * (np.ones(self.grid['num_wind']) - control['wind_curt'])
         else:
             p_w_curr = np.array([])
         y = np.concatenate([p_d_curr, q_d_curr, p_w_curr])
-
-        sigma = 0.05 * abs(y) + 1e-6
+        sigma = 0.01 * abs(y) + 1e-6
         y_sample = np.random.normal(loc = y,scale = sigma,size = y.shape)
-        y_next = np.minimum(np.maximum(y_sample, self.y_low),self.y_high)
+        # y_next = np.minimum(np.maximum(y_sample, self.y_low),self.y_high)
+        y_next = np.clip(y_sample, self.y_low, self.y_high)
         next_obs = np.concatenate([y_next, gen_p_mw]).astype(np.float64) #包含了松弛节点
-        # print(f"next_obs:{next_obs}")
-        # time.sleep(1)
 
         #依据next_obs和HELM输出修改next_state
         next_state = self.current_state.copy()
         
-        #切片要小心，可能会影响gen的顺序
+        # #切片要小心，可能会影响gen的顺序
         next_state['loads'][:, 0] = next_obs[:self.grid['num_loads']]
         next_state['loads'][:, 1] = next_obs[self.grid['num_loads']:self.grid['num_loads']+self.grid['num_loads']]
         
@@ -547,16 +572,13 @@ class PowerSystemEnv(gym.Env):
         # 更新状态
         self.current_state = next_state
 
-        # 计算成本C(公式1a)
-        C = self.calculate_generation_cost(self.current_state)   # 根据发电机实际出力计算
-
-        # 计算DCV(公式6)
+        # 计算DCV
         DCV = self.calculate_dcv(self.current_state)
 
-        # 奖励和终止判断(公式7)
-        reward = self.compute_reward(C, DCV, self.Cmax, epsilon0=1e-4, epsilon1=0.1, R0=100.0, R1=20.0)
+        # 奖励和终止判断
+        reward = self.compute_reward(C, DCV, self.Cmax, self.epsilon0, self.epsilon1, self.R0, self.R1)
 
-        # 提取观测值，也就是观测的状态空间，对应论文S
+        # 提取观测值，也就是观测的状态空间，对应论文S，这里要返回的其实是下一个状态
         obs = self._get_obs(self.current_state)
 
         terminated = self.terminated
@@ -565,7 +587,16 @@ class PowerSystemEnv(gym.Env):
         # 信息字典
         info = {
             'cost': C, 
-            'dcv': DCV
+            'dcv': DCV,
+            #添加参数
+            'served_load_pq': served_load_pq,
+            'gross_load_pq': gross_load_pq,
+            #验证能守
+            'S_HE_mw': S_HE_mw,
+            'S_gen': S_gen,
+            #奖励分解
+            'C_gen': C_gen,
+            'C_load_shed': C_load_shed
         }
 
         # 注意：gymnasium 需要返回 (obs, reward, terminated, truncated, info)
@@ -654,6 +685,213 @@ class CustomTimeLimit(gym.Wrapper, gym.utils.RecordConstructorArgs):
 
         self._cached_spec = env_spec
         return env_spec
+
+from typing import Optional
+from collections import deque
+class CustomRecordEpisodeStatistics(gym.Wrapper, gym.utils.RecordConstructorArgs):
+    """This wrapper will keep track of cumulative rewards and episode lengths.
+
+    At the end of an episode, the statistics of the episode will be added to ``info``
+    using the key ``episode``. If using a vectorized environment also the key
+    ``_episode`` is used which indicates whether the env at the respective index has
+    the episode statistics.
+
+    After the completion of an episode, ``info`` will look like this::
+
+        >>> info = {
+        ...     "episode": {
+        ...         "r": "<cumulative reward>",
+        ...         "l": "<episode length>",
+        ...         "t": "<elapsed time since beginning of episode>"
+        ...     },
+        ... }
+
+    For a vectorized environments the output will be in the form of::
+
+        >>> infos = {
+        ...     "final_observation": "<array of length num-envs>",
+        ...     "_final_observation": "<boolean array of length num-envs>",
+        ...     "final_info": "<array of length num-envs>",
+        ...     "_final_info": "<boolean array of length num-envs>",
+        ...     "episode": {
+        ...         "r": "<array of cumulative reward>",
+        ...         "l": "<array of episode length>",
+        ...         "t": "<array of elapsed time since beginning of episode>"
+        ...     },
+        ...     "_episode": "<boolean array of length num-envs>"
+        ... }
+
+    Moreover, the most recent rewards and episode lengths are stored in buffers that can be accessed via
+    :attr:`wrapped_env.return_queue` and :attr:`wrapped_env.length_queue` respectively.
+
+    Attributes:
+        return_queue: The cumulative rewards of the last ``deque_size``-many episodes
+        length_queue: The lengths of the last ``deque_size``-many episodes
+    """
+
+    def __init__(self, env: gym.Env, deque_size: int = 100):
+        """This wrapper will keep track of cumulative rewards and episode lengths.
+
+        Args:
+            env (Env): The environment to apply the wrapper
+            deque_size: The size of the buffers :attr:`return_queue` and :attr:`length_queue`
+        """
+        gym.utils.RecordConstructorArgs.__init__(self, deque_size=deque_size)
+        gym.Wrapper.__init__(self, env)
+
+        try:
+            self.num_envs = self.get_wrapper_attr("num_envs")
+            self.is_vector_env = self.get_wrapper_attr("is_vector_env")
+        except AttributeError:
+            self.num_envs = 1
+            self.is_vector_env = False
+
+        self.episode_count = 0
+        self.episode_start_times: np.ndarray = None
+        self.episode_returns: Optional[np.ndarray] = None
+        self.episode_lengths: Optional[np.ndarray] = None
+        self.return_queue = deque(maxlen=deque_size)
+        self.length_queue = deque(maxlen=deque_size)
+
+    def reset(self, **kwargs):
+        """Resets the environment using kwargs and resets the episode returns and lengths."""
+        obs, info = super().reset(**kwargs)
+        self.episode_start_times = np.full(
+            self.num_envs, time.perf_counter(), dtype=np.float32
+        )
+        self.episode_returns = np.zeros(self.num_envs, dtype=np.float32)
+        self.episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
+        return obs, info
+
+    def step(self, action):
+        """Steps through the environment, recording the episode statistics."""
+        (
+            observations,
+            rewards,
+            terminations,
+            truncations,
+            infos
+        ) = self.env.step(action)
+        assert isinstance(
+            infos, dict
+        ), f"`info` dtype is {type(infos)} while supported dtype is `dict`. This may be due to usage of other wrappers in the wrong order."
+        self.episode_returns += rewards
+        self.episode_lengths += 1
+        dones = np.logical_or(terminations, truncations)
+        num_dones = np.sum(dones)
+        if num_dones:
+            if "episode" in infos or "_episode" in infos:
+                raise ValueError(
+                    "Attempted to add episode stats when they already exist"
+                )
+            else:
+                infos["episode"] = {
+                    "r": np.where(dones, self.episode_returns, 0.0),
+                    "l": np.where(dones, self.episode_lengths, 0),
+                    "t": np.where(
+                        dones,
+                        np.round(time.perf_counter() - self.episode_start_times, 6),
+                        0.0,
+                    ),
+                }
+                if self.is_vector_env:
+                    infos["_episode"] = np.where(dones, True, False)
+            self.return_queue.extend(self.episode_returns[dones])
+            self.length_queue.extend(self.episode_lengths[dones])
+            self.episode_count += num_dones
+            self.episode_lengths[dones] = 0
+            self.episode_returns[dones] = 0
+            self.episode_start_times[dones] = time.perf_counter()
+        return (
+            observations,
+            rewards,
+            terminations,
+            truncations,
+            infos
+        )
+
+def add_chart_to_tensorboard(writer, global_step, info):
+    C_gen = info['C_gen']
+    C_load_shed = info['C_load_shed']
+    DCV = info['dcv']
+
+    R0 = 100.0
+    # epsilon0 = 1e-4
+    epsilon0 = 8e-4     #5e-4
+    DCV_penalty = min(R0, DCV / epsilon0)
+
+    writer.add_scalar("charts/C_gen", C_gen, global_step)
+    writer.add_scalar("charts/C_load_shed", C_load_shed, global_step)
+    writer.add_scalar("charts/DCV_penalty", DCV_penalty, global_step)
+
+def add_para_to_tensorboard(writer, global_step, info):
+    gross_load_pq = info['gross_load_pq']
+    served_load_pq = info['served_load_pq']
+
+    gross_load_p = gross_load_pq[:len(gross_load_pq)//2]
+    gross_load_q = gross_load_pq[len(gross_load_pq)//2:]
+    gross_load_p_sum = np.sum(gross_load_p)
+    gross_load_q_sum = np.sum(gross_load_q)
+    gross_load_p_mean = np.mean(gross_load_p)
+    gross_load_q_mean = np.mean(gross_load_q)
+    gross_load_p_min = np.min(gross_load_p)
+    gross_load_q_min = np.min(gross_load_q)
+    writer.add_scalar("para/gross_load_p_sum-step", gross_load_p_sum, global_step)
+    writer.add_scalar("para/gross_load_q_sum-step", gross_load_q_sum, global_step)
+    writer.add_scalar("para/gross_load_p_mean-step", gross_load_p_mean, global_step)
+    writer.add_scalar("para/gross_load_q_mean-step", gross_load_q_mean, global_step)
+    writer.add_scalar("para/gross_load_p_min-step", gross_load_p_min, global_step)
+    writer.add_scalar("para/gross_load_q_min-step", gross_load_q_min, global_step)
+
+    served_load_p = served_load_pq[:len(served_load_pq)//2]
+    served_load_q = served_load_pq[len(served_load_pq)//2:]
+    served_load_p_sum = np.sum(served_load_p)
+    served_load_q_sum = np.sum(served_load_q)
+    served_load_p_mean = np.mean(served_load_p)
+    served_load_q_mean = np.mean(served_load_q)
+    served_load_p_min = np.min(served_load_p)
+    served_load_q_min = np.min(served_load_q)
+    writer.add_scalar("para/served_load_p_sum-step", served_load_p_sum, global_step)
+    writer.add_scalar("para/served_load_q_sum-step", served_load_q_sum, global_step)
+    writer.add_scalar("para/served_load_p_mean-step", served_load_p_mean, global_step)
+    writer.add_scalar("para/served_load_q_mean-step", served_load_q_mean, global_step)
+    writer.add_scalar("para/served_load_p_min-step", served_load_p_min, global_step)
+    writer.add_scalar("para/served_load_q_min-step", served_load_q_min, global_step)
+
+def check_conservation_of_energy(info, writer, global_step):
+    served_load_pq = info['served_load_pq']
+    S_gen = info['S_gen']   #为什么用info的S_gen,因为还要算上松弛节点的出力
+    S_HE_mw = info['S_HE_mw']  #所有节点注入功率之和等于网损
+
+    #分成有功与无功分别验证
+    gen_p = np.real(S_gen)
+    gen_q = np.imag(S_gen)
+
+    served_load_p = served_load_pq[:len(served_load_pq)//2]
+    served_load_q = served_load_pq[len(served_load_pq)//2:]
+
+    loss_p = np.real(S_HE_mw)
+    loss_q = np.imag(S_HE_mw)
+
+    #开始计算综合
+    total_gen_p = np.sum(gen_p)
+    total_gen_q = np.sum(gen_q)
+
+    total_loss_p = np.sum(loss_p)
+    total_loss_q = np.sum(loss_q)
+
+    total_served_load_p = np.sum(served_load_p)
+    total_served_load_q = np.sum(served_load_q)
+
+    #检验有功,无功残差
+    residual_p = total_gen_p - total_served_load_p - total_loss_p
+    residual_q = total_gen_q - total_served_load_q - total_loss_q
+
+    # print(f"有功残差: {residual_p:.6f} MW")
+    # print(f"无功残差: {residual_q:.6f} MVar")
+
+    writer.add_scalar("para/residual_p-step", residual_p, global_step)
+    writer.add_scalar("para/residual_q-step", residual_q, global_step)
 
 
 

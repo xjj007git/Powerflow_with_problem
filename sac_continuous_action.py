@@ -14,6 +14,9 @@ import torch.optim as optim
 import tyro
 from torch.utils.tensorboard import SummaryWriter
 
+# import sys
+# sys.path.insert(0, r'D:\Users\xjj\AppData\Local\Programs\python_ws\Reference\cleanrl-master')
+
 from cleanrl_utils.buffers import ReplayBuffer
 # %%
 # print(__file__)

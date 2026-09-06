@@ -1,31 +1,31 @@
 from custom_envs import PowerSystemEnv
 from custom_envs import CustomTimeLimit
+from custom_envs import CustomRecordEpisodeStatistics
+from custom_envs import add_para_to_tensorboard
+from custom_envs import add_chart_to_tensorboard
+from custom_envs import check_conservation_of_energy
 import matlab.engine
 import numpy as np
 import time
-from gymnasium.wrappers import RecordEpisodeStatistics, TimeLimit
-
 import random
-
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from torch.utils.tensorboard import SummaryWriter
-
 from cleanrl_utils.buffers import ReplayBuffer
-
 from Single_sac import Args
 from Single_sac import Actor
 from Single_sac import SoftQNetwork1
 from Single_sac import SoftQNetwork2
-
 from gymnasium.vector import SyncVectorEnv
-from gymnasium.wrappers import AutoResetWrapper
-
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
+import os
+os.add_dll_directory(r"D:\Users\xjj\anaconda3\envs\hesac\Library\bin")
+import math
+import pandas as pd
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -5
@@ -42,12 +42,14 @@ if __name__ == "__main__":
     def make_env():
         env = PowerSystemEnv(mpc, path)
         env = CustomTimeLimit(env, max_episode_steps=288)
-        env = RecordEpisodeStatistics(env)
+        env = CustomRecordEpisodeStatistics(env, deque_size=100)
         return env
 
     args = tyro.cli(Args)
+    #先固定训练步数
+    # args.total_timesteps = 50000
 
-    writer = SummaryWriter("runs/30bus_14")
+    writer = SummaryWriter("runs/30bus_1")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -93,6 +95,7 @@ if __name__ == "__main__":
         n_envs=args.num_envs,
         handle_timeout_termination=False,
     )
+    gross_load_pq_list = []  # 用于记录每步的gross_load_pq
     start_time = time.time()
 
     # TRY NOT TO MODIFY: start the game
@@ -102,12 +105,42 @@ if __name__ == "__main__":
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             action = np.array(env.action_space.sample())
+            # print(f"global_step={global_step}, random action={action}")   #采集一个随机动作，方便我固定动作做测试
         else:
             action, _, _ = actor.get_action(torch.Tensor(obs).to(device))
             action = action.detach().cpu().numpy()
 
+        #固定动作测试环境单元
+        # action = np.array([2.0991030e+01,1.9663343e+01,4.6175299e+00,2.1679873e+00,3.9365467e+01,
+        #             9.5006186e-01,1.0572938e+00,1.0163674e+00,9.8251331e-01,1.0506465e+00,
+        #             1.0710058e+00,3.2419793e-02,6.0476184e-01,9.7409123e-01,8.1701368e-02,
+        #             6.2478316e-01,2.9376015e-01,1.2806474e-01,4.4767186e-01,2.0577361e-01,
+        #             3.9837193e-01,8.7941164e-01,1.4867796e-01,8.0984271e-01,8.3373344e-01,
+        #             4.5655915e-01,8.0827528e-01,2.2652337e-01,6.3903052e-01,4.3548229e-01,6.6719705e-01])
+
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, reward, termination, truncation, info = env.step(action)
+
+        #检查打印一下发电机出力
+        # served_gen_p = action[:5]
+        # print(f"global_step={global_step}, served_gen_p={served_gen_p}")        
+
+        #给tensorboard添加一些变量
+        # add_para_to_tensorboard(writer, global_step, info)
+        add_chart_to_tensorboard(writer, global_step, info)
+
+        #检查能量守恒
+        # check_conservation_of_energy(info, writer, global_step)
+
+        #这里是测试gross_load_pq是否会持续削减的
+        # gross_load_pq_list.append(gross_load_pq)
+        # if global_step == args.total_timesteps - 1:
+        #     #存为excel文件
+        #     cols = len(gross_load_pq)
+        #     rows = args.total_timesteps
+        #     data_2d = pd.DataFrame(gross_load_pq_list).values.reshape(rows, cols)
+        #     df = pd.DataFrame(data_2d)
+        #     df.to_excel("./data/gross_load_pq_with_shed.xlsx", index=False, header=False)
 
         if global_step > args.learning_starts:
             if 'dcv' in info:
